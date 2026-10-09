@@ -29,13 +29,66 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    url = f"{URL[region]}/readyz"
+    try:
+        r = httpx.get(url, timeout=timeout)
+        if r.status_code == 200:
+            return True, "ok"
+        return False, f"status_{r.status_code}"
+    except httpx.TimeoutException:
+        return False, "timeout"
+    except Exception as e:
+        return False, type(e).__name__
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    out.parent.mkdir(parents=True, exist_ok=True)
+    states = {"a": "HEALTHY", "b": "HEALTHY"}
+    fail_counts = {"a": 0, "b": 0}
+    end_time = time.time() + duration
+
+    while time.time() < end_time:
+        cycle_start = time.time()
+        for region in ("a", "b"):
+            ok, reason = probe(region, timeout)
+            if ok:
+                fail_counts[region] = 0
+                if states[region] == "UNHEALTHY":
+                    states[region] = "HEALTHY"
+                    record = {
+                        "ts": time.time(),
+                        "event": "state_change",
+                        "region": region,
+                        "to": "HEALTHY",
+                        "reason": reason,
+                        "interval_s": interval,
+                        "threshold": threshold,
+                        "consecutive_fails": 0,
+                    }
+                    with out.open("a") as f:
+                        f.write(json.dumps(record) + "\n")
+                    print("HEALTH_CHECK", json.dumps(record))
+            else:
+                fail_counts[region] += 1
+                if fail_counts[region] >= threshold and states[region] == "HEALTHY":
+                    states[region] = "UNHEALTHY"
+                    record = {
+                        "ts": time.time(),
+                        "event": "state_change",
+                        "region": region,
+                        "to": "UNHEALTHY",
+                        "reason": reason,
+                        "interval_s": interval,
+                        "threshold": threshold,
+                        "consecutive_fails": fail_counts[region],
+                    }
+                    with out.open("a") as f:
+                        f.write(json.dumps(record) + "\n")
+                    print("HEALTH_CHECK", json.dumps(record))
+
+        elapsed = time.time() - cycle_start
+        sleep_time = max(0.0, interval - elapsed)
+        time.sleep(sleep_time)
 
 
 if __name__ == "__main__":

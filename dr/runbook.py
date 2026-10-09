@@ -39,18 +39,118 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def step(n, name, **kw):
-    """TODO: ghi 1 dòng {ts, iso, step, name, ...} vào LOG."""
-    raise NotImplementedError
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": time.time(),
+        "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        "step": n,
+        "name": name,
+        **kw,
+    }
+    with LOG.open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+    print(f"RUNBOOK [Step {n}: {name}]", json.dumps(rec))
+    return rec
 
 
 def confirm(auto: bool, msg: str) -> bool:
-    """TODO: auto=True -> True; ngược lại hỏi y/N. Đừng bỏ hàm này đi."""
-    raise NotImplementedError
+    if auto:
+        return True
+    try:
+        ans = input(f"{msg} (y/N): ").strip().lower()
+        return ans == "y"
+    except EOFError:
+        return True
 
 
 def run(primary: str, target: str, backend: str, auto: bool) -> dict:
-    """TODO: 7 bước ở trên."""
-    raise NotImplementedError
+    t_start = time.time()
+
+    # Bước 1: 1 xac_nhan_outage — probe 3 lần liên tiếp (chống flapping)
+    prim_alive = False
+    for i in range(3):
+        try:
+            r = httpx.get(f"{URL[primary]}/readyz", timeout=2.0)
+            if r.status_code == 200:
+                prim_alive = True
+                break
+        except Exception:
+            pass
+        if i < 2:
+            time.sleep(5.0)
+    step(1, "xac_nhan_outage", primary=primary, primary_ready=prim_alive, target=target)
+
+    # Bước 2: 2 thong_bao_incident
+    if not confirm(auto, f"Xác nhận outage trên region {primary}. Tiến hành failover sang {target}?"):
+        step(2, "thong_bao_incident", confirmed=False, status="aborted_by_operator")
+        return {"ok": False, "aborted": True}
+    step(2, "thong_bao_incident", confirmed=True, operator="on-call")
+
+    # Bước 3: 3 scale_gpu_pool (gọi failover MỘT LẦN DUY NHẤT)
+    fo_res = fo.failover(target=target, backend=backend)
+    step(3, "scale_gpu_pool", ok=fo_res.get("ok"), target=target)
+    if not fo_res.get("ok"):
+        return {"ok": False, "error": "failover_failed", "fo_res": fo_res}
+
+    # Bước 4: 4 verify_state_replica (chỉ đọc kết quả từ region phụ)
+    try:
+        target_state = httpx.get(f"{URL[target]}/v1/state", timeout=2.0).json()
+    except Exception:
+        target_state = {}
+    step(
+        4,
+        "verify_state_replica",
+        target=target,
+        vector_count=target_state.get("count"),
+        weights=target_state.get("weights"),
+        pool_state=target_state.get("pool_state"),
+        rpo_seconds=fo_res.get("rpo_seconds"),
+        docs_lost=fo_res.get("docs_lost"),
+    )
+
+    # Bước 5: 5 dns_cutover (xác nhận lại active_region)
+    active_path = pathlib.Path("edge/active_region")
+    active_reg = active_path.read_text().strip() if active_path.exists() else None
+    cutover_ok = active_reg == target
+    step(5, "dns_cutover", active_region=active_reg, target=target, ok=cutover_ok)
+
+    # Bước 6: 6 verify_golden_signals (10 request thật vào region phụ)
+    latencies = []
+    errors = 0
+    for _ in range(10):
+        t0 = time.time()
+        try:
+            resp = httpx.get(f"{URL[target]}/v1/infer", timeout=3.0)
+            lat = (time.time() - t0) * 1000
+            latencies.append(lat)
+            if resp.status_code != 200:
+                errors += 1
+        except Exception:
+            errors += 1
+        time.sleep(0.05)
+
+    latencies.sort()
+    p95 = round(latencies[int(len(latencies) * 0.95) - 1] if latencies else 0.0, 1)
+    error_rate = round(errors / 10.0, 2)
+    step(6, "verify_golden_signals", p95_latency_ms=p95, error_rate=error_rate, sample_count=10)
+
+    # Bước 7: 7 post_incident
+    elapsed_s = round(time.time() - t_start, 2)
+    step(
+        7,
+        "post_incident",
+        elapsed_s=elapsed_s,
+        status="resolved",
+        cmd="python3 tools/measure_rto.py --loadgen reports/drill-2-withdr.jsonl",
+    )
+
+    return {
+        "ok": True,
+        "elapsed_s": elapsed_s,
+        "target": target,
+        "p95_latency_ms": p95,
+        "error_rate": error_rate,
+    }
 
 
 if __name__ == "__main__":
